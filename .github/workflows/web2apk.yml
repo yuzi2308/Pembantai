@@ -17,6 +17,9 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
       - name: Setup Java
         uses: actions/setup-java@v4
         with:
@@ -26,24 +29,33 @@ jobs:
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version: '3.44.0'
+          flutter-version: '3.22.0'  # Versi stabil terbaru
           channel: stable
           cache: true
+
+      - name: Setup Android SDK
+        run: |
+          yes | sdkmanager "platforms;android-34" "build-tools;34.0.0"
 
       - name: Create Flutter Project
         run: |
           APP_NAME="${{ github.event.inputs.app_name }}"
-          PKG=$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]' | tr ' ' '_' | tr -cd '[:alnum:]_')
-          flutter create --org com.webapk --project-name "$PKG" myapp
+          PKG=$(echo "$APP_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/ /_/g' | sed 's/[^a-z0-9_]//g')
+          flutter create --org com.webapk --project-name "$PKG" --platforms android myapp
 
       - name: Add Assets and Dependencies
         run: |
           cd myapp
-          flutter pub add webview_flutter
-          flutter pub add flutter_launcher_icons
-          flutter pub add connectivity_plus
+          flutter pub add webview_flutter:^4.7.0
+          flutter pub add flutter_launcher_icons:^0.13.1
+          flutter pub add connectivity_plus:^6.0.3
+          flutter pub add cupertino_icons:^1.0.8
 
-          # Menambahkan konfigurasi assets ke baris paling bawah untuk menghindari error indentasi YAML
+          # Update minSdkVersion
+          sed -i 's/minSdkVersion .*/minSdkVersion 21/' android/app/build.gradle
+
+          # Menambahkan konfigurasi assets
+          echo "" >> pubspec.yaml
           echo "  assets:" >> pubspec.yaml
           echo "    - assets/icon/" >> pubspec.yaml
 
@@ -73,9 +85,12 @@ jobs:
             @override
             Widget build(BuildContext context) {
               return MaterialApp(
-                title: r'$APP_NAME',
+                title: '$APP_NAME',
                 debugShowCheckedModeBanner: false,
-                theme: ThemeData(useMaterial3: true, primarySwatch: Colors.blue),
+                theme: ThemeData(
+                  useMaterial3: true, 
+                  colorScheme: ColorScheme.fromSeed(seedColor: Colors.blue),
+                ),
                 home: const SplashScreen(),
               );
             }
@@ -159,8 +174,8 @@ jobs:
 
               await Future.delayed(const Duration(milliseconds: 1000));
 
-              var connectivityResult = await (Connectivity().checkConnectivity());
-              if (connectivityResult.every((r) => r == ConnectivityResult.none)) {
+              var connectivityResult = await Connectivity().checkConnectivity();
+              if (connectivityResult.contains(ConnectivityResult.none)) {
                 setState(() {
                   _isChecking = false;
                 });
@@ -286,7 +301,7 @@ jobs:
                         ),
                         const SizedBox(height: 28),
                         Text(
-                          r'$APP_NAME',
+                          '$APP_NAME',
                           style: const TextStyle(
                             fontSize: 26,
                             fontWeight: FontWeight.w700,
@@ -330,18 +345,24 @@ jobs:
             void initState() {
               super.initState();
               _connectivity = Connectivity();
+              
+              WebViewPlatform.instance = AndroidWebViewPlatform();
+              
               _controller = WebViewController()
                 ..setJavaScriptMode(JavaScriptMode.unrestricted)
                 ..setBackgroundColor(Colors.white)
                 ..setNavigationDelegate(NavigationDelegate(
+                  onPageError: (url, errorCode, errorDescription) {
+                    _showNoConnectionDialog();
+                  },
                   onWebResourceError: (error) {
-                    if (error.isForMainFrame == true) _showNoConnectionDialog();
+                    if (error.isForMainFrame) _showNoConnectionDialog();
                   },
                 ))
-                ..loadRequest(Uri.parse(r'$WEB_URL'));
+                ..loadRequest(Uri.parse('$WEB_URL'));
 
               _connectivitySub = _connectivity.onConnectivityChanged.listen((results) {
-                if (results.every((r) => r == ConnectivityResult.none)) {
+                if (results.contains(ConnectivityResult.none)) {
                   _showNoConnectionDialog();
                 }
               });
@@ -393,7 +414,7 @@ jobs:
             Widget build(BuildContext context) {
               return PopScope(
                 canPop: false,
-                onPopInvoked: (didPop) async {
+                onPopInvoked: (bool didPop, _) async {
                   if (didPop) return;
                   if (await _controller.canGoBack()) {
                     await _controller.goBack();
@@ -411,17 +432,17 @@ jobs:
           }
           DART
 
-          # Mengubah pembatas slash (/) menjadi pagar (#) agar link HTTP tidak merusak regex sed
-          sed -i "s#r'\$APP_NAME'#'$APP_NAME'#g" myapp/lib/main.dart
-          sed -i "s#r'\$WEB_URL'#'$WEB_URL'#g" myapp/lib/main.dart
-
       - name: Fix Android Permissions and App Name
         run: |
           APP_NAME="${{ github.event.inputs.app_name }}"
           MANIFEST="myapp/android/app/src/main/AndroidManifest.xml"
           
-          sed -i '/<manifest xmlns:android/a\    <uses-permission android:name="android.permission.INTERNET"\/>' $MANIFEST
-          sed -i '/<manifest xmlns:android/a\    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"\/>' $MANIFEST
+          # Add permissions
+          sed -i '/<manifest xmlns:android/a\    <uses-permission android:name="android.permission.INTERNET" />' $MANIFEST
+          sed -i '/<manifest xmlns:android/a\    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />' $MANIFEST
+          sed -i '/<manifest xmlns:android/a\    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />' $MANIFEST
+          
+          # Update app name
           sed -i "s/android:label=\"[^\"]*\"/android:label=\"$APP_NAME\"/" $MANIFEST
 
       - name: Setup Network Security (Allow HTTP)
@@ -438,27 +459,35 @@ jobs:
           </network-security-config>
           EOF
           
+          # Add network security config to manifest
           sed -i 's/<application/<application android:networkSecurityConfig="@xml\/network_security_config"/' \
             myapp/android/app/src/main/AndroidManifest.xml
 
       - name: Download and Sanitize Icon
         run: |
           mkdir -p myapp/assets/icon
+          sudo apt-get update
           sudo apt-get install -y imagemagick
 
+          # Download icon
           curl -L \
             -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
             -H "Accept: application/octet-stream" \
             "${{ github.event.inputs.icon_url }}" \
-            -o myapp/assets/icon/icon_raw
+            -o myapp/assets/icon/icon_raw || wget -O myapp/assets/icon/icon_raw "${{ github.event.inputs.icon_url }}"
 
-          # Mengubah gambar menjadi format PNG 1024x1024 yang valid
-          convert myapp/assets/icon/icon_raw \
-            -background transparent \
-            -gravity center \
-            -resize 1024x1024 \
-            -extent 1024x1024 \
-            myapp/assets/icon/icon.png
+          # Convert to PNG and resize
+          if [ -f myapp/assets/icon/icon_raw ]; then
+            convert myapp/assets/icon/icon_raw \
+              -background transparent \
+              -gravity center \
+              -resize 1024x1024 \
+              -extent 1024x1024 \
+              myapp/assets/icon/icon.png
+          else
+            # Create default icon if download fails
+            convert -size 1024x1024 xc:blue myapp/assets/icon/icon.png
+          fi
 
       - name: Write launcher icons config
         run: |
@@ -468,20 +497,36 @@ jobs:
             ios: false
             image_path: "assets/icon/icon.png"
             min_sdk_android: 21
+            adaptive_icon_background: "#ffffff"
+            adaptive_icon_foreground: "assets/icon/icon.png"
           EOF
 
       - name: Generate Icons
         run: |
           cd myapp
-          dart run flutter_launcher_icons -f flutter_launcher_icons.yaml
+          flutter pub get
+          dart run flutter_launcher_icons:generate -f flutter_launcher_icons.yaml
+
+      - name: Fix Gradle Configuration
+        run: |
+          cd myapp/android
+          # Update gradle wrapper
+          sed -i 's/gradle-.*-all.zip/gradle-8.3-all.zip/g' gradle/wrapper/gradle-wrapper.properties
+          
+          # Update build.gradle
+          cat >> app/build.gradle << 'EOF'
+          
+          android {
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          EOF
 
       - name: Build APK
         run: |
           cd myapp
-          flutter build apk --release
-
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: web2apk-release
-          path: myapp/build/app/outputs/flutter-apk/app-release.apk
+          flutter clean
+          flutter pub get
+          flutter build apk --release --split-per-ab
